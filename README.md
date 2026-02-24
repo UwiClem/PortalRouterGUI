@@ -61,4 +61,5 @@ TROUBLESHOOTING
 - GDAL errors: ensure Conda Python is used, not QGIS Python.
 
 LICENSE
+
 MIT License
