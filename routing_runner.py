@@ -1,0 +1,629 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import argparse
+import time
+from typing import List, Tuple, Optional, Dict
+
+import numpy as np
+import geopandas as gpd
+import networkx as nx
+from shapely.geometry import Point, LineString, MultiLineString, GeometryCollection
+from shapely.ops import unary_union, nearest_points
+from shapely.prepared import prep
+from scipy.spatial import cKDTree
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+ROUND_DECIMALS = 6
+
+
+def tprint(verbose: bool, msg: str):
+    if verbose:
+        print(msg, flush=True)
+
+
+def rkey(x: float, y: float) -> Tuple[float, float]:
+    return (round(float(x), ROUND_DECIMALS), round(float(y), ROUND_DECIMALS))
+
+
+def _iter_lines(geom):
+    if geom is None or geom.is_empty:
+        return
+    if isinstance(geom, LineString):
+        yield geom
+    elif isinstance(geom, MultiLineString):
+        for g in geom.geoms:
+            yield g
+    elif isinstance(geom, GeometryCollection):
+        for g in geom.geoms:
+            yield from _iter_lines(g)
+
+
+def sample_line(ls: LineString, spacing: float) -> List[Tuple[float, float]]:
+    if ls is None or ls.is_empty:
+        return []
+    length = float(ls.length)
+    if length <= 0:
+        return []
+    steps = max(2, int(length / spacing) + 1)
+    pts = []
+    for i in range(steps):
+        p = ls.interpolate(i / (steps - 1), normalized=True)
+        pts.append((float(p.x), float(p.y)))
+    return pts
+
+
+def grid_points(poly, spacing: float) -> List[Tuple[float, float]]:
+    """
+    Dense interior grid sampling (kept as user's objective).
+    This is expensive: corridor clipping + linear edge building keeps runtime manageable.
+    """
+    if poly is None or poly.is_empty:
+        return []
+    minx, miny, maxx, maxy = poly.bounds
+    xs = np.arange(minx, maxx + spacing, spacing)
+    ys = np.arange(miny, maxy + spacing, spacing)
+    pts = []
+    for x in xs:
+        for y in ys:
+            p = Point(float(x), float(y))
+            if poly.contains(p):
+                pts.append((float(x), float(y)))
+    return pts
+
+
+def segment_blocked(p0, p1, blocked) -> bool:
+    """
+    Avoid intersects() to not block boundary travel.
+    Block only if it goes through interior.
+    """
+    if blocked is None or blocked.is_empty:
+        return False
+    seg = LineString([p0, p1])
+    return seg.crosses(blocked) or seg.within(blocked)
+
+
+def shrink_blocked(blocked, clearance: float):
+    if blocked is None or blocked.is_empty or clearance <= 0:
+        return blocked
+    try:
+        s = blocked.buffer(-abs(clearance))
+        return s if (s is not None and not s.is_empty) else blocked
+    except Exception:
+        return blocked
+
+
+# ============================================================
+# 1) Landuse split
+# ============================================================
+
+def split_landuse(gdf: gpd.GeoDataFrame):
+    col = None
+    for c in gdf.columns:
+        if str(c).strip().lower() in ("kind", "type"):
+            col = c
+            break
+
+    if col is None:
+        raise RuntimeError("Landuse must contain 'kind' or 'Type' field.")
+
+    s = gdf[col].astype(str).str.strip().str.lower()
+    s = s.replace({"water": "river", "waterway": "river", "stream": "river"})
+
+    public = gdf[s == "public"]
+    private = gdf[s == "private"]
+    river = gdf[s == "river"]
+    bridge = gdf[s == "bridge"]
+    return public, private, river, bridge
+
+
+# ============================================================
+# 2) Corridor clip
+# ============================================================
+
+def clip_landuse_to_corridor(gdf: gpd.GeoDataFrame, corridor) -> gpd.GeoDataFrame:
+    if gdf is None or len(gdf) == 0:
+        return gdf
+    if corridor is None or corridor.is_empty:
+        return gdf
+
+    sindex = gdf.sindex
+    hits = list(sindex.intersection(corridor.bounds))
+    if not hits:
+        return gdf.iloc[0:0].copy()
+
+    sub = gdf.iloc[hits].copy()
+
+    corr_p = prep(corridor)
+    mask = sub.geometry.apply(lambda g: (g is not None and (not g.is_empty) and corr_p.intersects(g)))
+    sub = sub[mask].copy()
+    if len(sub) == 0:
+        return sub
+
+    def _clip(g):
+        try:
+            return g.intersection(corridor)
+        except Exception:
+            try:
+                gg = g.buffer(0)
+                return gg.intersection(corridor)
+            except Exception:
+                return None
+
+    sub["geometry"] = sub.geometry.apply(_clip)
+    sub = sub[sub.geometry.notnull()].copy()
+    sub = sub[~sub.geometry.is_empty].copy()
+
+    return sub
+
+
+# ============================================================
+# 3) Private shared boundaries (optional, but kept)
+# ============================================================
+
+def private_shared_edges(private: gpd.GeoDataFrame):
+    if private is None or len(private) < 2:
+        return None
+
+    priv = private.copy()
+    priv["geometry"] = priv.geometry.buffer(0)  # clean
+    boundaries = priv.geometry.boundary
+    sindex = priv.sindex
+
+    shared_parts = []
+    for i, geom_i in enumerate(priv.geometry):
+        if geom_i is None or geom_i.is_empty:
+            continue
+
+        hits = list(sindex.intersection(geom_i.bounds))
+        for j in hits:
+            if j <= i:
+                continue
+            geom_j = priv.geometry.iloc[j]
+            if geom_j is None or geom_j.is_empty:
+                continue
+
+            if not geom_i.touches(geom_j) and not geom_i.intersects(geom_j):
+                continue
+
+            inter = boundaries.iloc[i].intersection(boundaries.iloc[j])
+            if inter is None or inter.is_empty:
+                continue
+
+            for ln in _iter_lines(inter):
+                if ln.length > 0:
+                    shared_parts.append(ln)
+
+    if not shared_parts:
+        return None
+    return unary_union(shared_parts)
+
+
+def build_private_blocked_allow_shared(private: gpd.GeoDataFrame,
+                                      shared: Optional[object],
+                                      carve_tol: float):
+    if private is None or len(private) == 0:
+        return None
+
+    u = unary_union(list(private.geometry))
+    if u is None or u.is_empty:
+        return None
+
+    eps = 1e-6
+    try:
+        interior = u.buffer(-eps)
+        private_blocked = interior if (interior is not None and not interior.is_empty) else u
+    except Exception:
+        private_blocked = u
+
+    if shared is not None and (not shared.is_empty) and carve_tol > 0:
+        try:
+            corridor = shared.buffer(carve_tol)
+            private_blocked = private_blocked.difference(corridor)
+        except Exception:
+            pass
+
+    return private_blocked
+
+
+# ============================================================
+# 4) Portal generation with grid mask
+# ============================================================
+
+def generate_portals_with_types(public, bridge, shared_private, spacing: float):
+    """
+    Returns:
+      portals: (N,2) array of unique points
+      is_grid: boolean array (N,) indicating interior-grid portals (public+bridge interior)
+    """
+    grid_pts: List[Tuple[float, float]] = []
+    other_pts: List[Tuple[float, float]] = []
+
+    # Public: boundary -> other, interior -> grid
+    for geom in public.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        for ln in _iter_lines(geom.boundary):
+            other_pts.extend(sample_line(ln, spacing))
+        grid_pts.extend(grid_points(geom, spacing))
+
+    # Bridge: boundary -> other, interior -> grid
+    for geom in bridge.geometry:
+        if geom is None or geom.is_empty:
+            continue
+        for ln in _iter_lines(geom.boundary):
+            other_pts.extend(sample_line(ln, spacing))
+        grid_pts.extend(grid_points(geom, spacing))
+
+    # Shared private boundary portals -> other
+    if shared_private is not None and (not shared_private.is_empty):
+        for ln in _iter_lines(shared_private):
+            other_pts.extend(sample_line(ln, spacing))
+
+    # Build unique portal list, preserving "grid" label if point appears in both
+    idx: Dict[Tuple[float, float], int] = {}
+    portals: List[Tuple[float, float]] = []
+    is_grid: List[bool] = []
+
+    def add_pt(xy: Tuple[float, float], grid_flag: bool):
+        k = rkey(xy[0], xy[1])
+        if k in idx:
+            # if already exists, upgrade to grid if needed
+            if grid_flag and not is_grid[idx[k]]:
+                is_grid[idx[k]] = True
+            return
+        idx[k] = len(portals)
+        portals.append((float(k[0]), float(k[1])))
+        is_grid.append(bool(grid_flag))
+
+    for xy in other_pts:
+        add_pt(xy, grid_flag=False)
+    for xy in grid_pts:
+        add_pt(xy, grid_flag=True)
+
+    if not portals:
+        return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=bool)
+
+    return np.array(portals, dtype=float), np.array(is_grid, dtype=bool)
+
+
+# ============================================================
+# 5) Grid neighbor offsets (ring)
+# ============================================================
+
+def make_ring_offsets(ring: int) -> List[Tuple[int, int]]:
+    """
+    Chebyshev ring: all offsets with max(|dx|,|dy|) <= ring, excluding (0,0).
+    ring=1 -> up to 8 neighbors
+    ring=2 -> up to 24 neighbors
+    ring=3 -> up to 48 neighbors
+    """
+    ring = max(1, int(ring))
+    offs = []
+    for dx in range(-ring, ring + 1):
+        for dy in range(-ring, ring + 1):
+            if dx == 0 and dy == 0:
+                continue
+            offs.append((dx, dy))
+    return offs
+
+
+# ============================================================
+# 6) Graph build (FAST): grid local edges + limited kNN edges for non-grid
+# ============================================================
+
+def build_graph_fast(
+    portals: np.ndarray,
+    is_grid: np.ndarray,
+    spacing: float,
+    grid_ring: int,
+    non_grid_k: int,
+    non_grid_max_dist: float,
+    blocked,
+    clearance: float,
+    skip_grid_block_check: bool,
+    verbose: bool
+):
+    G = nx.Graph()
+    for i, p in enumerate(portals):
+        G.add_node(int(i), pos=(float(p[0]), float(p[1])))
+
+    blocked2 = shrink_blocked(blocked, clearance)
+
+    # Index for exact grid-neighbor lookup
+    coord_to_id: Dict[Tuple[float, float], int] = {rkey(p[0], p[1]): int(i) for i, p in enumerate(portals)}
+
+    # 6a) Grid -> Grid local neighbor edges (linear scaling)
+    offsets = make_ring_offsets(grid_ring)
+    grid_ids = np.where(is_grid)[0]
+
+    grid_edges_added = 0
+    t0 = time.perf_counter()
+    for i in grid_ids:
+        x0, y0 = float(portals[i, 0]), float(portals[i, 1])
+        for dx, dy in offsets:
+            xn = x0 + dx * spacing
+            yn = y0 + dy * spacing
+            j = coord_to_id.get(rkey(xn, yn))
+            if j is None:
+                continue
+            if not is_grid[j]:
+                continue
+            if j <= i:
+                continue
+
+            if (not skip_grid_block_check) and segment_blocked((x0, y0), (float(portals[j, 0]), float(portals[j, 1])), blocked2):
+                continue
+
+            w = float(np.hypot(x0 - portals[j, 0], y0 - portals[j, 1]))
+            G.add_edge(int(i), int(j), weight=w)
+            grid_edges_added += 1
+
+    tprint(verbose, f"[graph] grid edges: {grid_edges_added:,} in {time.perf_counter()-t0:.2f}s")
+
+    # 6b) Non-grid portals connect to nearby portals using kNN (keeps boundary/bridge/shared usable)
+    # Build KDTree over all portals once
+    tree = cKDTree(portals)
+
+    non_grid_ids = np.where(~is_grid)[0]
+    nn_edges_added = 0
+    t1 = time.perf_counter()
+
+    if len(portals) > 0 and len(non_grid_ids) > 0 and non_grid_k > 0:
+        k = min(int(non_grid_k), len(portals))
+        for i in non_grid_ids:
+            p0 = portals[i]
+            dists, idxs = tree.query(p0, k=k)
+            # If k==1, dists/idxs are scalars; normalize
+            if np.isscalar(idxs):
+                idxs = np.array([idxs], dtype=int)
+                dists = np.array([dists], dtype=float)
+
+            for d, j in zip(dists, idxs):
+                j = int(j)
+                if j == int(i):
+                    continue
+                if float(d) > float(non_grid_max_dist):
+                    continue
+                if j < i:
+                    # only add in one direction (avoid duplicates)
+                    continue
+
+                p1 = (float(portals[j, 0]), float(portals[j, 1]))
+                if segment_blocked((float(p0[0]), float(p0[1])), p1, blocked2):
+                    continue
+
+                G.add_edge(int(i), int(j), weight=float(d))
+                nn_edges_added += 1
+
+    tprint(verbose, f"[graph] non-grid kNN edges: {nn_edges_added:,} in {time.perf_counter()-t1:.2f}s")
+
+    return G, tree
+
+
+def add_terminal_knn(
+    G: nx.Graph,
+    tree: cKDTree,
+    portals: np.ndarray,
+    xy: Tuple[float, float],
+    node_id: int,
+    terminal_k: int,
+    max_dist: float,
+    blocked,
+    clearance: float,
+    verbose: bool
+):
+    G.add_node(int(node_id), pos=(float(xy[0]), float(xy[1])))
+    blocked2 = shrink_blocked(blocked, clearance)
+
+    if len(portals) == 0:
+        return
+
+    k = min(int(terminal_k), len(portals))
+    dists, idxs = tree.query(np.array([xy[0], xy[1]], dtype=float), k=k)
+
+    # normalize scalar
+    if np.isscalar(idxs):
+        idxs = np.array([idxs], dtype=int)
+        dists = np.array([dists], dtype=float)
+
+    added = 0
+    for d, i in zip(dists, idxs):
+        i = int(i)
+        p1 = (float(portals[i, 0]), float(portals[i, 1]))
+        if float(d) > float(max_dist):
+            continue
+        if segment_blocked((float(xy[0]), float(xy[1])), p1, blocked2):
+            continue
+        G.add_edge(int(node_id), int(i), weight=float(d))
+        added += 1
+
+    # stronger fallback: connect to nearest regardless of max_dist (prevents trivial "no path")
+    if added == 0:
+        d, i = tree.query(np.array([xy[0], xy[1]], dtype=float), k=1)
+        i = int(i)
+        p1 = (float(portals[i, 0]), float(portals[i, 1]))
+        if not segment_blocked((float(xy[0]), float(xy[1])), p1, blocked2):
+            G.add_edge(int(node_id), int(i), weight=float(d))
+            tprint(verbose, f"[terminal] fallback connected terminal {node_id} to nearest portal at distance {float(d):.2f}")
+
+
+def heuristic(a, b, G):
+    pa = G.nodes[a]["pos"]
+    pb = G.nodes[b]["pos"]
+    return float(np.hypot(pa[0] - pb[0], pa[1] - pb[1]))
+
+
+# ============================================================
+# 7) Snap terminals to allowed area
+# ============================================================
+
+def snap_to_allowed(xy, allowed_union):
+    x, y = float(xy[0]), float(xy[1])
+    p = Point(x, y)
+
+    if allowed_union is None or allowed_union.is_empty:
+        return (x, y)
+
+    if allowed_union.contains(p):
+        return (x, y)
+
+    try:
+        _, snapped = nearest_points(p, allowed_union)
+        return (float(snapped.x), float(snapped.y))
+    except Exception:
+        try:
+            b = allowed_union.boundary
+            snapped = b.interpolate(b.project(p))
+            return (float(snapped.x), float(snapped.y))
+        except Exception:
+            return (x, y)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--landuse", required=True)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--out", required=True)
+
+    parser.add_argument("--spacing", type=float, default=20.0)
+    parser.add_argument("--max_dist", type=float, default=200.0)
+    parser.add_argument("--epsg", type=int, default=25832)
+
+    # Corridor buffer in CRS units (meters in most projected CRSs). 0 disables clipping.
+    parser.add_argument("--buffer", type=float, default=0.0)
+
+    # Graph tuning (new)
+    parser.add_argument("--grid_ring", type=int, default=2, help="Grid neighbor ring. ring=1->8, ring=2->24, ring=3->48 max.")
+    parser.add_argument("--non_grid_k", type=int, default=12, help="k-nearest edges for non-grid portals (boundary/shared).")
+    parser.add_argument("--terminal_k", type=int, default=24, help="k-nearest portals to connect start/end terminals.")
+    parser.add_argument("--skip_grid_block_check", action="store_true", help="Skip blocked check for grid-grid edges (faster, diagnostic).")
+
+    # GUI compatibility (QGIS plugin passes these)
+    parser.add_argument("--clearance", type=float, default=0.0)
+    parser.add_argument("--no_plot", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+
+    args = parser.parse_args()
+    verbose = bool(args.verbose)
+
+    t_all = time.perf_counter()
+
+    start = tuple(map(float, args.start.split(",")))
+    end = tuple(map(float, args.end.split(",")))
+
+    t0 = time.perf_counter()
+    landuse = gpd.read_file(args.landuse).to_crs(epsg=args.epsg)
+    tprint(verbose, f"[io] read+reproject landuse: {len(landuse):,} features in {time.perf_counter()-t0:.2f}s")
+
+    # Corridor clip FIRST
+    if float(args.buffer) > 0:
+        t1 = time.perf_counter()
+        corridor = LineString([start, end]).buffer(float(args.buffer))
+        landuse = clip_landuse_to_corridor(landuse, corridor)
+        tprint(verbose, f"[clip] corridor buffer {args.buffer} -> {len(landuse):,} features in {time.perf_counter()-t1:.2f}s")
+
+    public, private, river, bridge = split_landuse(landuse)
+    if len(public) == 0:
+        raise RuntimeError("No PUBLIC polygons found inside the corridor. Cannot route.")
+
+    # Allowed: public + bridge
+    t2 = time.perf_counter()
+    public_union = unary_union(list(public.geometry)) if len(public) else None
+    bridge_union = unary_union(list(bridge.geometry)) if len(bridge) else None
+    allowed_parts = [g for g in (public_union, bridge_union) if g is not None and not g.is_empty]
+    allowed_union = unary_union(allowed_parts) if allowed_parts else public_union
+    tprint(verbose, f"[union] allowed union in {time.perf_counter()-t2:.2f}s")
+
+    # Shared private boundaries
+    t3 = time.perf_counter()
+    shared_private = private_shared_edges(private)
+    tprint(verbose, f"[private] shared edges in {time.perf_counter()-t3:.2f}s")
+
+    carve_tol = max(1e-6, float(args.spacing) * 0.02)
+
+    # Blocked: private interior (minus shared corridor) + river
+    t4 = time.perf_counter()
+    private_blocked = build_private_blocked_allow_shared(private, shared_private, carve_tol=carve_tol)
+    river_blocked = unary_union(list(river.geometry)) if len(river) else None
+    blocked_parts = [g for g in (private_blocked, river_blocked) if g is not None and not g.is_empty]
+    blocked_union = unary_union(blocked_parts) if blocked_parts else None
+    tprint(verbose, f"[union] blocked union in {time.perf_counter()-t4:.2f}s")
+
+    # Snap terminals
+    start = snap_to_allowed(start, allowed_union)
+    end = snap_to_allowed(end, allowed_union)
+
+    # Portals + types
+    t5 = time.perf_counter()
+    portals, is_grid = generate_portals_with_types(public, bridge, shared_private, float(args.spacing))
+    if len(portals) == 0:
+        raise RuntimeError("No portals generated. Try smaller spacing or check geometry.")
+    tprint(verbose, f"[portals] total={len(portals):,} grid={int(is_grid.sum()):,} other={int((~is_grid).sum()):,} in {time.perf_counter()-t5:.2f}s")
+
+    # Build fast graph
+    t6 = time.perf_counter()
+    G, tree = build_graph_fast(
+        portals=portals,
+        is_grid=is_grid,
+        spacing=float(args.spacing),
+        grid_ring=int(args.grid_ring),
+        non_grid_k=int(args.non_grid_k),
+        non_grid_max_dist=float(args.max_dist),
+        blocked=blocked_union,
+        clearance=float(args.clearance),
+        skip_grid_block_check=bool(args.skip_grid_block_check),
+        verbose=verbose,
+    )
+    tprint(verbose, f"[graph] nodes={G.number_of_nodes():,} edges={G.number_of_edges():,} built in {time.perf_counter()-t6:.2f}s")
+
+    # Add terminals
+    sid = int(len(portals))
+    eid = int(len(portals) + 1)
+    add_terminal_knn(
+        G, tree, portals, start, sid,
+        terminal_k=int(args.terminal_k),
+        max_dist=float(args.max_dist),
+        blocked=blocked_union,
+        clearance=float(args.clearance),
+        verbose=verbose
+    )
+    add_terminal_knn(
+        G, tree, portals, end, eid,
+        terminal_k=int(args.terminal_k),
+        max_dist=float(args.max_dist),
+        blocked=blocked_union,
+        clearance=float(args.clearance),
+        verbose=verbose
+    )
+
+    if not nx.has_path(G, sid, eid):
+        raise RuntimeError(
+            "No path exists.\n"
+            "Try: increase --buffer, increase --max_dist, or increase --grid_ring.\n"
+            "Also ensure PUBLIC/BRIDGE areas connect inside the corridor."
+        )
+
+    # A*
+    t7 = time.perf_counter()
+    path = nx.astar_path(G, sid, eid, heuristic=lambda a, b: heuristic(a, b, G))
+    coords = [G.nodes[n]["pos"] for n in path]
+    tprint(verbose, f"[route] A* path nodes={len(path):,} in {time.perf_counter()-t7:.2f}s")
+
+    out = gpd.GeoDataFrame(geometry=[LineString(coords)], crs=landuse.crs)
+    out.to_file(args.out, driver="GeoJSON")
+
+    tprint(verbose, f"[done] total time {time.perf_counter()-t_all:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
